@@ -1,0 +1,942 @@
+#include "crow.h"
+#include <nlohmann/json.hpp>
+#include <pcap.h>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <filesystem>
+#include <map>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <memory>
+#include <cstring>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip_icmp.h>
+#include <mysql/mysql.h>
+#include <atomic>
+#include <csignal>
+#include <future>
+
+using namespace std;
+using json = nlohmann::json;
+
+// ===================== DATABASE CONFIGURATION =====================
+struct DBConfig {
+    string host = "localhost";
+    string user = "root";
+    string password = "ROOT";
+    string database = "netscope";
+    int port = 3306;
+};
+
+// ===================== DATABASE CONNECTION CLASS =====================
+class DatabaseConnection {
+private:
+    MYSQL* conn;
+    DBConfig config;
+    mutex dbMutex;
+    
+public:
+    DatabaseConnection(const DBConfig& cfg) : config(cfg), conn(nullptr) {}
+    
+    ~DatabaseConnection() {
+        disconnect();
+    }
+    
+    bool connect() {
+        lock_guard<mutex> lock(dbMutex);
+        
+        conn = mysql_init(nullptr);
+        if (!conn) {
+            cerr << "✖ MySQL initialization failed" << endl;
+            return false;
+        }
+        
+        my_bool reconnect = 1;
+        mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
+        
+        if (!mysql_real_connect(conn, config.host.c_str(), config.user.c_str(),
+                                config.password.c_str(), config.database.c_str(),
+                                config.port, nullptr, 0)) {
+            cerr << "✖ MySQL connection failed: " << mysql_error(conn) << endl;
+            mysql_close(conn);
+            conn = nullptr;
+            return false;
+        }
+        
+        cout << "✓ Connected to MySQL database: " << config.database << endl;
+        return true;
+    }
+    
+    void disconnect() {
+        lock_guard<mutex> lock(dbMutex);
+        if (conn) {
+            mysql_close(conn);
+            conn = nullptr;
+        }
+    }
+    
+    bool executeQuery(const string& query) {
+        lock_guard<mutex> lock(dbMutex);
+        
+        if (!conn) {
+            cerr << "✖ Database connection lost" << endl;
+            return false;
+        }
+        
+        if (mysql_query(conn, query.c_str())) {
+            cerr << "✖ Query failed: " << mysql_error(conn) << endl;
+            return false;
+        }
+        
+        return true;
+    }
+    
+    bool isConnected() {
+        lock_guard<mutex> lock(dbMutex);
+        if (!conn) return false;
+        return mysql_ping(conn) == 0;
+    }
+    
+    string escapeString(const string& str) {
+        lock_guard<mutex> lock(dbMutex);
+        
+        if (!conn) return str;
+        
+        char* escaped = new char[str.length() * 2 + 1];
+        mysql_real_escape_string(conn, escaped, str.c_str(), str.length());
+        string result(escaped);
+        delete[] escaped;
+        return result;
+    }
+    
+    MYSQL* getConnection() {
+        return conn;
+    }
+    
+    mutex& getMutex() {
+        return dbMutex;
+    }
+};
+
+// ===================== PACKET BATCH INSERTER =====================
+class PacketBatchInserter {
+private:
+    DatabaseConnection& db;
+    vector<tuple<long long, string, string, int, int, string, string, int, string>> batchData;
+    mutex batchMutex;
+    const size_t BATCH_SIZE = 100;
+    
+public:
+    PacketBatchInserter(DatabaseConnection& database) : db(database) {}
+    
+    void addPacket(long long timestamp, const string& srcIP, const string& destIP,
+                   int srcPort, int destPort, const string& l4Proto, 
+                   const string& appProto, int length, const string& summary) {
+        
+        lock_guard<mutex> lock(batchMutex);
+        
+        batchData.push_back(make_tuple(timestamp, srcIP, destIP, srcPort, destPort, 
+                                       l4Proto, appProto, length, summary));
+        
+        if (batchData.size() >= BATCH_SIZE) {
+            flush();
+        }
+    }
+    
+    void flush() {
+        lock_guard<mutex> lock(batchMutex);
+        
+        if (batchData.empty()) return;
+        
+        try {
+            lock_guard<mutex> dbLock(db.getMutex());
+            MYSQL* conn = db.getConnection();
+            if (!conn) return;
+            
+            string query = "INSERT INTO packets (timestamp, src_ip, dest_ip, src_port, dest_port, "
+                          "l4_protocol, app_protocol, length, summary) VALUES ";
+            
+            for (size_t i = 0; i < batchData.size(); i++) {
+                const auto& data = batchData[i];
+                
+                char buffer[2048];
+                // dynamic escaping for safety - ensure no overflow
+                string summaryStr = get<8>(data);
+                string escapedSummary;
+                if (conn) {
+                    escapedSummary.resize(summaryStr.size() * 2 + 1);
+                    unsigned long newLen = mysql_real_escape_string(conn, &escapedSummary[0], summaryStr.c_str(), summaryStr.size());
+                    escapedSummary.resize(newLen);
+                } else {
+                    escapedSummary = summaryStr;
+                }
+                
+                snprintf(buffer, sizeof(buffer),
+                         "(%lld, '%s', '%s', %d, %d, '%s', '%s', %d, '%s')",
+                         get<0>(data), get<1>(data).c_str(), get<2>(data).c_str(),
+                         get<3>(data), get<4>(data), get<5>(data).c_str(),
+                         get<6>(data).c_str(), get<7>(data), escapedSummary.c_str());
+                
+                query += buffer;
+                if (i < batchData.size() - 1) query += ", ";
+            }
+            
+            if (mysql_query(conn, query.c_str())) {
+                cerr << "✖ Batch insert failed: " << mysql_error(conn) << endl;
+            } else {
+                cout << "✓ Inserted batch of " << batchData.size() << " packets" << endl;
+            }
+            
+            batchData.clear();
+            
+        } catch (const exception& e) {
+            cerr << "✖ Batch insert exception: " << e.what() << endl;
+            batchData.clear();
+        }
+    }
+};
+
+// ===================== STATISTICS UPDATER =====================
+class StatsUpdater {
+private:
+    DatabaseConnection& db;
+    map<string, int> sourceIPCounts;
+    map<string, int> destIPCounts;
+    map<string, int> protocolCounts;
+    mutex statsMutex;
+    
+public:
+    StatsUpdater(DatabaseConnection& database) : db(database) {}
+    
+    void addSourceIP(const string& ip) {
+        lock_guard<mutex> lock(statsMutex);
+        sourceIPCounts[ip]++;
+    }
+    
+    void addDestIP(const string& ip) {
+        lock_guard<mutex> lock(statsMutex);
+        destIPCounts[ip]++;
+    }
+    
+    void addProtocol(const string& protocol) {
+        lock_guard<mutex> lock(statsMutex);
+        protocolCounts[protocol]++;
+    }
+    
+    void updateDatabase() {
+        lock_guard<mutex> lock(statsMutex);
+        lock_guard<mutex> dbLock(db.getMutex());
+        
+        MYSQL* conn = db.getConnection();
+        if (!conn) return;
+        
+        try {
+            cout << "✓ Updating IP statistics..." << endl;
+            
+            for (const auto& [ip, count] : sourceIPCounts) {
+                char query[512];
+                snprintf(query, sizeof(query),
+                         "INSERT INTO ip_stats (ip, type, packet_count) VALUES ('%s', 'SOURCE', %d) "
+                         "ON DUPLICATE KEY UPDATE packet_count = packet_count + %d",
+                         ip.c_str(), count, count);
+                
+                if (mysql_query(conn, query)) {
+                    cerr << "✖ Source IP update failed: " << mysql_error(conn) << endl;
+                }
+            }
+            
+            for (const auto& [ip, count] : destIPCounts) {
+                char query[512];
+                snprintf(query, sizeof(query),
+                         "INSERT INTO ip_stats (ip, type, packet_count) VALUES ('%s', 'DEST', %d) "
+                         "ON DUPLICATE KEY UPDATE packet_count = packet_count + %d",
+                         ip.c_str(), count, count);
+                
+                if (mysql_query(conn, query)) {
+                    cerr << "✖ Dest IP update failed: " << mysql_error(conn) << endl;
+                }
+            }
+            
+            cout << "✓ Updating protocol statistics..." << endl;
+            
+            for (const auto& [protocol, count] : protocolCounts) {
+                char query[512];
+                snprintf(query, sizeof(query),
+                         "INSERT INTO protocol_stats (protocol_name, count) VALUES ('%s', %d) "
+                         "ON DUPLICATE KEY UPDATE count = count + %d",
+                         protocol.c_str(), count, count);
+                
+                if (mysql_query(conn, query)) {
+                    cerr << "✖ Protocol update failed: " << mysql_error(conn) << endl;
+                }
+            }
+            
+            cout << "✓ Database statistics updated successfully" << endl;
+            
+        } catch (const exception& e) {
+            cerr << "✖ Stats update exception: " << e.what() << endl;
+        }
+    }
+};
+
+// ===================== PACKET CLASS =====================
+class Packet {
+public:
+    int id;
+    string timestamp;
+    string srcIP;
+    string destIP;
+    int srcPort;
+    int destPort;
+    string l4Protocol;
+    string appProtocol;
+    string summary;
+    int length;
+    
+    // FIXED: Frontend expects "protocol" not "l4_protocol"
+    json to_json() const {
+        return json{
+            {"number", id},
+            {"source", srcIP + (srcPort > 0 ? ":" + to_string(srcPort) : "")},
+            {"destination", destIP + (destPort > 0 ? ":" + to_string(destPort) : "")},
+            {"protocol", l4Protocol},  // FIXED: Changed from l4_protocol to protocol
+            {"app_protocol", appProtocol},
+            {"length", length},
+            {"summary", summary},
+            {"timestamp", timestamp}
+        };
+    }
+};
+
+// ===================== PROTOCOL PARSERS =====================
+class ProtocolParser {
+public:
+    virtual bool canParse(const Packet& pkt) const = 0;
+    virtual void parse(Packet& pkt) = 0;
+    virtual ~ProtocolParser() {}
+};
+
+class HTTPParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return (pkt.l4Protocol == "TCP" && 
+                (pkt.destPort == 80 || pkt.srcPort == 80 || pkt.destPort == 8080 || pkt.srcPort == 8080));
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "HTTP";
+        pkt.summary = string("HTTP ") + (pkt.destPort == 80 || pkt.destPort == 8080 ? "request" : "response");
+    }
+};
+
+class HTTPSParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return (pkt.l4Protocol == "TCP" && (pkt.destPort == 443 || pkt.srcPort == 443));
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "HTTPS";
+        pkt.summary = "HTTPS encrypted traffic";
+    }
+};
+
+class DNSParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return ((pkt.l4Protocol == "UDP" || pkt.l4Protocol == "TCP") && 
+                (pkt.destPort == 53 || pkt.srcPort == 53));
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "DNS";
+        pkt.summary = string("DNS ") + (pkt.destPort == 53 ? "query" : "response");
+    }
+};
+
+class FTPParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return (pkt.l4Protocol == "TCP" && 
+                (pkt.destPort == 21 || pkt.srcPort == 21 || pkt.destPort == 20 || pkt.srcPort == 20));
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "FTP";
+        pkt.summary = (pkt.destPort == 21 || pkt.srcPort == 21) ? "FTP control" : "FTP data";
+    }
+};
+
+class SSHParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return (pkt.l4Protocol == "TCP" && (pkt.destPort == 22 || pkt.srcPort == 22));
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "SSH";
+        pkt.summary = "SSH secure shell";
+    }
+};
+
+class SMTPParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return (pkt.l4Protocol == "TCP" && 
+                (pkt.destPort == 25 || pkt.srcPort == 25 || pkt.destPort == 587 || pkt.srcPort == 587));
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "SMTP";
+        pkt.summary = "SMTP mail transfer";
+    }
+};
+
+class DHCPParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return (pkt.l4Protocol == "UDP" && 
+                (pkt.destPort == 67 || pkt.destPort == 68 || pkt.srcPort == 67 || pkt.srcPort == 68));
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "DHCP";
+        pkt.summary = string("DHCP ") + (pkt.destPort == 67 ? "request" : "response");
+    }
+};
+
+class ICMPParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return pkt.l4Protocol == "ICMP";
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "ICMP";
+        pkt.summary = "ICMP packet";
+    }
+};
+
+class ARPParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return pkt.l4Protocol == "ARP";
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "ARP";
+        pkt.summary = "ARP address resolution";
+    }
+};
+
+class GenericUDPParser : public ProtocolParser {
+public:
+    bool canParse(const Packet& pkt) const override {
+        return pkt.l4Protocol == "UDP" && pkt.appProtocol.empty();
+    }
+    void parse(Packet& pkt) override {
+        pkt.appProtocol = "UDP";
+        pkt.summary = "Generic UDP traffic on port " + to_string(pkt.destPort);
+    }
+};
+
+// ===================== STATISTICS CALCULATOR =====================
+class StatsCalculator {
+private:
+    map<string, int> protocolCount;
+    map<string, int> appProtocolCount;
+    map<string, int> sourceIPCount;
+    map<string, int> destIPCount;
+    int totalBytes = 0;
+    
+public:
+    void addPacket(const Packet& pkt) {
+        protocolCount[pkt.l4Protocol]++;
+        if (!pkt.appProtocol.empty()) {
+            appProtocolCount[pkt.appProtocol]++;
+        }
+        sourceIPCount[pkt.srcIP]++;
+        destIPCount[pkt.destIP]++;
+        totalBytes += pkt.length;
+    }
+    
+    json getStats(int totalPackets) {
+        json stats;
+        stats["TotalPackets"] = totalPackets;
+        stats["TotalBytes"] = totalBytes;
+        stats["UniqueSourceIPs"] = sourceIPCount.size();
+        stats["UniqueDestIPs"] = destIPCount.size();
+        
+        json protocolDist = json::object();
+        for (const auto& [protocol, count] : protocolCount) {
+            protocolDist[protocol] = count;
+        }
+        stats["ProtocolDistribution"] = protocolDist;
+        
+        json appProtocolDist = json::object();
+        for (const auto& [protocol, count] : appProtocolCount) {
+            appProtocolDist[protocol] = count;
+        }
+        stats["AppProtocolDistribution"] = appProtocolDist;
+        
+        vector<pair<string, int>> topSources(sourceIPCount.begin(), sourceIPCount.end());
+        sort(topSources.begin(), topSources.end(), 
+             [](const pair<string,int>& a, const pair<string,int>& b) { return a.second > b.second; });
+        
+        json topSourcesJson = json::array();
+        for (int i = 0; i < min(5, (int)topSources.size()); i++) {
+            topSourcesJson.push_back({{"ip", topSources[i].first}, {"count", topSources[i].second}});
+        }
+        stats["TopSources"] = topSourcesJson;
+        
+        vector<pair<string, int>> topDests(destIPCount.begin(), destIPCount.end());
+        sort(topDests.begin(), topDests.end(), 
+             [](const pair<string,int>& a, const pair<string,int>& b) { return a.second > b.second; });
+        
+        json topDestsJson = json::array();
+        for (int i = 0; i < min(5, (int)topDests.size()); i++) {
+            topDestsJson.push_back({{"ip", topDests[i].first}, {"count", topDests[i].second}});
+        }
+        stats["TopDestinations"] = topDestsJson;
+        
+        return stats;
+    }
+};
+
+// ===================== CANCELLATION + THREAD GLOBALS =====================
+static std::atomic<bool> cancelAnalysis(false);
+static std::thread analysisThread;
+static std::mutex analysisThreadMutex;
+
+// ===================== PCAP ANALYZER WITH DATABASE =====================
+// Modified to accept cancel flag
+json analyze_pcap(const string& filepath, DatabaseConnection& db, std::atomic<bool>& cancelFlag) {
+    json result;
+    result["success"] = false;
+    result["packets"] = json::array();
+    result["error"] = "";
+    result["database_status"] = "disconnected";
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* handle = pcap_open_offline(filepath.c_str(), errbuf);
+    
+    if (!handle) {
+        result["error"] = string("Invalid PCAP format or corrupted file: ") + errbuf;
+        cout << "ERROR: " << result["error"] << endl;
+        return result;
+    }
+
+    cout << "✓ Analyzing PCAP file: " << filepath << endl;
+    
+    PacketBatchInserter batchInserter(db);
+    StatsUpdater statsUpdater(db);
+    bool dbConnected = db.isConnected();
+    
+    if (dbConnected) {
+        result["database_status"] = "connected";
+        cout << "✓ Database connected - packets will be stored" << endl;
+    } else {
+        cout << "⚠ Database not connected - analysis will continue without storage" << endl;
+    }
+
+    struct pcap_pkthdr* header;
+    const u_char* data;
+    int packetCount = 0;
+
+    vector<ProtocolParser*> parsers = { 
+        new HTTPParser(), new HTTPSParser(), new DNSParser(),
+        new FTPParser(), new SSHParser(), new SMTPParser(),
+        new DHCPParser(), new ICMPParser(), new ARPParser(),
+        new GenericUDPParser()
+    };
+    
+    vector<Packet> packets;
+    StatsCalculator stats;
+
+    while (pcap_next_ex(handle, &header, &data) >= 0) {
+        if (cancelFlag.load()) {
+            cout << "⚠ Analysis cancelled by request" << endl;
+            break;
+        }
+
+        if (!header || !data) continue;
+
+        Packet pkt;
+        pkt.id = ++packetCount;
+        pkt.timestamp = to_string(header->ts.tv_sec);
+        pkt.length = header->len;
+        pkt.srcPort = 0;
+        pkt.destPort = 0;
+
+        if (header->len < sizeof(struct ether_header)) continue;
+        
+        const struct ether_header* eth = (const struct ether_header*)data;
+        u_short etherType = ntohs(eth->ether_type);
+
+        if (etherType == ETHERTYPE_ARP) { 
+            pkt.l4Protocol = "ARP";
+            pkt.srcIP = "ARP";
+            pkt.destIP = "ARP";
+            pkt.appProtocol = "ARP";
+            pkt.summary = "ARP packet";
+            packets.push_back(pkt);
+            stats.addPacket(pkt);
+            
+            if (dbConnected) {
+                batchInserter.addPacket(header->ts.tv_sec, pkt.srcIP, pkt.destIP,
+                                       pkt.srcPort, pkt.destPort, pkt.l4Protocol,
+                                       pkt.appProtocol, pkt.length, pkt.summary);
+                statsUpdater.addProtocol(pkt.l4Protocol);
+            }
+            continue;
+        }
+
+        if (etherType == ETHERTYPE_IP) {
+            if (header->len < sizeof(struct ether_header) + sizeof(struct ip)) continue;
+            
+            const struct ip* ipHeader = (const struct ip*)(data + sizeof(struct ether_header));
+            
+            char srcIPStr[INET_ADDRSTRLEN];
+            char destIPStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(ipHeader->ip_src), srcIPStr, INET_ADDRSTRLEN);
+            inet_ntop(AF_INET, &(ipHeader->ip_dst), destIPStr, INET_ADDRSTRLEN);
+            
+            pkt.srcIP = string(srcIPStr);
+            pkt.destIP = string(destIPStr);
+            int ipHeaderLen = ipHeader->ip_hl * 4;
+            
+            if (ipHeader->ip_p == IPPROTO_TCP) {
+                pkt.l4Protocol = "TCP";
+                if (header->len >= sizeof(struct ether_header) + ipHeaderLen + sizeof(struct tcphdr)) {
+                    const struct tcphdr* tcpHeader = (const struct tcphdr*)(data + sizeof(struct ether_header) + ipHeaderLen);
+                    pkt.srcPort = ntohs(tcpHeader->th_sport);
+                    pkt.destPort = ntohs(tcpHeader->th_dport);
+                }
+            } 
+            else if (ipHeader->ip_p == IPPROTO_UDP) {
+                pkt.l4Protocol = "UDP";
+                if (header->len >= sizeof(struct ether_header) + ipHeaderLen + sizeof(struct udphdr)) {
+                    const struct udphdr* udpHeader = (const struct udphdr*)(data + sizeof(struct ether_header) + ipHeaderLen);
+                    pkt.srcPort = ntohs(udpHeader->uh_sport);
+                    pkt.destPort = ntohs(udpHeader->uh_dport);
+                }
+            } 
+            else if (ipHeader->ip_p == IPPROTO_ICMP) {
+                pkt.l4Protocol = "ICMP";
+                pkt.srcPort = pkt.destPort = 0;
+            } 
+            else {
+                pkt.l4Protocol = "Other";
+                pkt.appProtocol = "Unknown";
+                pkt.summary = "IP Protocol: " + to_string(ipHeader->ip_p);
+            }
+        } else {
+            pkt.l4Protocol = "Other";
+            pkt.srcIP = "N/A";
+            pkt.destIP = "N/A";
+            pkt.appProtocol = "Unknown";
+            pkt.summary = "EtherType: 0x" + to_string(etherType);
+        }
+
+        bool parsed = false;
+        for (auto parser : parsers) {
+            if (parser->canParse(pkt)) {
+                parser->parse(pkt);
+                parsed = true;
+                break;
+            }
+        }
+        if (!parsed && pkt.appProtocol.empty()) {
+            pkt.appProtocol = "Unknown";
+            pkt.summary = "Unidentified traffic";
+        }
+
+        packets.push_back(pkt);
+        stats.addPacket(pkt);
+        
+        if (dbConnected) {
+            batchInserter.addPacket(header->ts.tv_sec, pkt.srcIP, pkt.destIP,
+                                   pkt.srcPort, pkt.destPort, pkt.l4Protocol,
+                                   pkt.appProtocol, pkt.length, pkt.summary);
+            statsUpdater.addSourceIP(pkt.srcIP);
+            statsUpdater.addDestIP(pkt.destIP);
+            statsUpdater.addProtocol(pkt.l4Protocol);
+        }
+    }
+
+    // FIXED: Ensure batch insert completes before returning
+    if (dbConnected) {
+        batchInserter.flush();
+        statsUpdater.updateDatabase();
+    }
+
+    for (const auto& pkt : packets) {
+        result["packets"].push_back(pkt.to_json());
+    }
+
+    result["success"] = true;
+    result["stats"] = stats.getStats(packetCount);
+
+    for (auto parser : parsers) delete parser;
+    pcap_close(handle);
+
+    cout << "✓ Analysis complete: " << packetCount << " packets processed" << endl;
+    return result;
+}
+
+// ===================== CORS HELPER =====================
+crow::response add_cors_headers(crow::response&& res) {
+    res.add_header("Access-Control-Allow-Origin", "*");
+    res.add_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.add_header("Access-Control-Allow-Headers", "Content-Type");
+    return move(res);
+}
+
+// ===================== MAIN SERVER =====================
+int main() {
+    DBConfig dbConfig;
+    dbConfig.host = "localhost";
+    dbConfig.user = "root";
+    dbConfig.password = "ROOT";
+    dbConfig.database = "netscope";
+    dbConfig.port = 3306;
+
+    DatabaseConnection db(dbConfig);
+    bool dbConnected = db.connect();
+    
+    if (!dbConnected) {
+        cout << "⚠ Warning: Database connection failed. Server will run without database storage." << endl;
+    }
+
+    crow::SimpleApp app;
+
+    if (!filesystem::exists("uploads")) {
+        filesystem::create_directory("uploads");
+    }
+    if (!filesystem::exists("static")) {
+        filesystem::create_directory("static");
+    }
+
+    CROW_ROUTE(app, "/")([](const crow::request& req) {
+        ifstream file("static/index.html");
+        if (!file.is_open()) return add_cors_headers(crow::response(404, "File not found"));
+        string content((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+        auto res = crow::response(200, content);
+        res.set_header("Content-Type", "text/html");
+        return add_cors_headers(move(res));
+    });
+
+    CROW_ROUTE(app, "/style.css")([](const crow::request& req) {
+        ifstream file("static/style.css");
+        if (!file.is_open()) return add_cors_headers(crow::response(404, "File not found"));
+        string content((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+        auto res = crow::response(200, content);
+        res.set_header("Content-Type", "text/css");
+        return add_cors_headers(move(res));
+    });
+
+    CROW_ROUTE(app, "/script.js")([](const crow::request& req) {
+        ifstream file("static/script.js");
+        if (!file.is_open()) return add_cors_headers(crow::response(404, "File not found"));
+        string content((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+        auto res = crow::response(200, content);
+        res.set_header("Content-Type", "application/javascript");
+        return add_cors_headers(move(res));
+    });
+
+    // FIXED: Always return valid JSON, add file cleanup, use unique filenames
+    CROW_ROUTE(app, "/upload").methods(crow::HTTPMethod::POST)
+    ([&db](const crow::request& req) {
+        cout << "\n=== New Upload Request ===" << endl;
+        json response;
+        
+        // FIXED: Use unique timestamp-based filename to avoid conflicts
+        string filepath = "uploads/upload_" + to_string(time(NULL)) + "_" + 
+                         to_string(rand() % 10000) + ".pcap";
+        
+        try {
+            if (req.body.empty()) {
+                response["success"] = false;
+                response["error"] = "Empty file uploaded";
+                response["packets"] = json::array();
+                response["stats"] = json::object();
+                auto res = crow::response(400, response.dump());
+                res.set_header("Content-Type", "application/json");
+                return add_cors_headers(move(res));
+            }
+            
+            ofstream outfile(filepath, ios::binary);
+            if (!outfile.is_open()) {
+                response["success"] = false;
+                response["error"] = "Could not create upload file";
+                response["packets"] = json::array();
+                response["stats"] = json::object();
+                auto res = crow::response(500, response.dump());
+                res.set_header("Content-Type", "application/json");
+                return add_cors_headers(move(res));
+            }
+            outfile.write(req.body.c_str(), req.body.size());
+            outfile.close();
+
+            cout << "✓ File saved: " << filepath << " (" << req.body.size() << " bytes)" << endl;
+            
+            // --- New: Run analysis in worker thread with cancellation support ---
+            {
+                std::lock_guard<std::mutex> lk(analysisThreadMutex);
+                if (analysisThread.joinable()) {
+                    response["success"] = false;
+                    response["error"] = "Another analysis is currently running. Please clear or wait.";
+                    response["packets"] = json::array();
+                    response["stats"] = json::object();
+                    try { filesystem::remove(filepath); } catch (...) {}
+                    auto res = crow::response(409, response.dump());
+                    res.set_header("Content-Type", "application/json");
+                    return add_cors_headers(move(res));
+                }
+
+                auto prom = std::make_shared<std::promise<json>>();
+                std::future<json> fut = prom->get_future();
+
+                // Launch worker thread for analysis
+                analysisThread = std::thread([prom, filepath, &db]() {
+                    try {
+                        json result = analyze_pcap(filepath, db, cancelAnalysis);
+                        prom->set_value(result);
+                    } catch (const std::exception& e) {
+                        json err;
+                        err["success"] = false;
+                        err["error"] = string("Exception in analysis thread: ") + e.what();
+                        prom->set_value(err);
+                    } catch (...) {
+                        json err;
+                        err["success"] = false;
+                        err["error"] = string("Unknown exception in analysis thread");
+                        prom->set_value(err);
+                    }
+                });
+
+                // Wait for analysis result (blocking behavior preserved)
+                json analysis_result;
+                try {
+                    analysis_result = fut.get();
+                } catch (const std::exception& e) {
+                    analysis_result["success"] = false;
+                    analysis_result["error"] = string("Failed to get analysis result: ") + e.what();
+                    analysis_result["packets"] = json::array();
+                    analysis_result["stats"] = json::object();
+                } catch (...) {
+                    analysis_result["success"] = false;
+                    analysis_result["error"] = "Failed to get analysis result (unknown error)";
+                    analysis_result["packets"] = json::array();
+                    analysis_result["stats"] = json::object();
+                }
+
+                // Ensure thread finished
+                if (analysisThread.joinable()) {
+                    analysisThread.join();
+                }
+
+                // FIXED: Clean up uploaded file after analysis
+                try {
+                    if (filesystem::exists(filepath)) {
+                        filesystem::remove(filepath);
+                        cout << "✓ Cleaned up temporary file: " << filepath << endl;
+                    }
+                } catch (const exception& e) {
+                    cerr << "⚠ Warning: Could not delete temp file: " << e.what() << endl;
+                }
+
+                // Ensure response always has required fields
+                if (!analysis_result.contains("packets")) {
+                    analysis_result["packets"] = json::array();
+                }
+                if (!analysis_result.contains("stats")) {
+                    analysis_result["stats"] = json::object();
+                }
+                
+                auto res = crow::response(200, analysis_result.dump());
+                res.set_header("Content-Type", "application/json");
+                return add_cors_headers(move(res));
+            }
+            // --- end worker thread block ---
+
+        } catch (const exception& e) {
+            // FIXED: Always return valid JSON even on exception
+            response["success"] = false;
+            response["error"] = string("Exception: ") + e.what();
+            response["packets"] = json::array();
+            response["stats"] = json::object();
+            
+            cout << "ERROR: " << e.what() << endl;
+            
+            // FIXED: Clean up file on error too
+            try {
+                if (filesystem::exists(filepath)) {
+                    filesystem::remove(filepath);
+                }
+            } catch (...) {}
+            
+            auto res = crow::response(500, response.dump());
+            res.set_header("Content-Type", "application/json");
+            return add_cors_headers(move(res));
+        }
+    });
+
+    CROW_ROUTE(app, "/upload").methods(crow::HTTPMethod::OPTIONS)
+    ([](const crow::request& req) {
+        return add_cors_headers(crow::response(200, ""));
+    });
+
+    // New: Clear route to cancel running analysis
+    CROW_ROUTE(app, "/clear").methods(crow::HTTPMethod::POST)([](const crow::request&){
+        json response;
+        // Signal cancel
+        cancelAnalysis.store(true);
+
+        // Join existing analysis thread (if any)
+        {
+            std::lock_guard<std::mutex> lk(analysisThreadMutex);
+            if (analysisThread.joinable()) {
+                cout << "✓ Waiting for analysis thread to stop..." << endl;
+                analysisThread.join();
+                cout << "✓ Analysis thread stopped" << endl;
+            }
+        }
+
+        cancelAnalysis.store(false); // reset for future runs
+        response["success"] = true;
+        response["message"] = "Cleared and cancelled running analysis.";
+        auto res = crow::response(200, response.dump());
+        res.set_header("Content-Type", "application/json");
+        return add_cors_headers(move(res));
+    });
+
+    // Install simple signal handler that requests cancellation.
+    // We avoid doing heavy work inside the signal handler.
+    std::signal(SIGINT, [](int){ 
+        cout << "\n⚠ SIGINT received: requesting cancel..." << endl;
+        cancelAnalysis.store(true);
+    });
+
+    cout << "\n╔═══════════════════════════════════════╗" << endl;
+    cout << "║   NetScope Analyzer Backend Server    ║" << endl;
+    cout << "╚═══════════════════════════════════════╝" << endl;
+    cout << "\n✓ Server: http://localhost:8080" << endl;
+    cout << "✓ Upload: POST http://localhost:8080/upload" << endl;
+    cout << "✓ Database: " << (dbConnected ? "Connected" : "Disconnected") << endl;
+    cout << "\n[Press Ctrl+C to stop]" << endl;
+
+    app.port(8080).multithreaded().run();
+
+    // After Crow stops (e.g. due to SIGINT), ensure any analysis thread is joined
+    {
+        std::lock_guard<std::mutex> lk(analysisThreadMutex);
+        if (analysisThread.joinable()) {
+            cout << "✓ Joining analysis thread before final exit..." << endl;
+            analysisThread.join();
+            cout << "✓ Analysis thread joined" << endl;
+        }
+    }
+
+    return 0;
+}
