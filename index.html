@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetScope Analyzer | Professional PCAP Analysis</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        /* Session Modal Styles */
+        .session-modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(5px);
+            align-items: center;
+            justify-content: center;
+        }
+
+        .session-modal-content {
+            background: linear-gradient(145deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 2rem;
+            width: 90%;
+            max-width: 700px;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        .session-modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .session-modal-header h2 {
+            margin: 0;
+            color: #fff;
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .close-modal {
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            color: #fff;
+            font-size: 1.5rem;
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .close-modal:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: scale(1.1);
+        }
+
+        .sessions-list {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .session-item {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 1.25rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+
+        .session-item:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(59, 130, 246, 0.5);
+            transform: translateX(5px);
+        }
+
+        .session-info {
+            flex: 1;
+        }
+
+        .session-name {
+            color: #fff;
+            font-weight: 600;
+            font-size: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .session-time {
+            color: #94a3b8;
+            font-size: 0.875rem;
+        }
+
+        .btn-load {
+            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px rgba(59, 130, 246, 0.3);
+        }
+
+        .btn-load:hover {
+            background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(59, 130, 246, 0.4);
+        }
+
+        .no-sessions {
+            text-align: center;
+            padding: 3rem 2rem;
+            color: #94a3b8;
+        }
+
+        .no-sessions p:first-child {
+            font-size: 1.25rem;
+            margin-bottom: 0.5rem;
+            color: #cbd5e1;
+        }
+
+        .no-sessions-hint {
+            font-size: 0.875rem;
+            color: #64748b;
+        }
+
+        #sessionsBtn {
+            display: none;
+            margin-left: 1rem;
+        }
+
+        .hero-section {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .hero-content {
+            flex: 1;
+        }
+
+        .hero-content h1 {
+            margin: 0;
+        }
+
+        .hero-content p {
+            margin: 0.5rem 0 0 0;
+        }
+
+        /* Animation */
+        .fade-in {
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Scrollbar styling for modal */
+        .session-modal-content::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .session-modal-content::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+        }
+
+        .session-modal-content::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+
+        .session-modal-content::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="hero-section">
+            <div class="hero-content">
+                <h1>🔍 NetScope Analyzer</h1>
+                <p>Professional Network Packet Analysis Dashboard</p>
+            </div>
+            <button id="sessionsBtn" class="btn-secondary btn-glow" style="display: none;">
+                📋 Previous Uploads
+            </button>
+        </header>
+
+        <!-- Upload Section -->
+        <div class="upload-section glass-card">
+            <div class="upload-area" id="uploadArea">
+                <div class="upload-icon">📂</div>
+                <h3>Upload Your PCAP File</h3>
+                <p>Drag & drop a .pcap / .pcapng file or click to browse</p>
+                <input type="file" id="fileInput" accept=".pcap,.pcapng" style="display:none;">
+                <button id="browseBtn" class="btn-primary btn-glow">Choose File</button>
+            </div>
+
+            <div class="file-info" id="fileInfo" style="display:none;">
+                <div class="file-details">
+                    <span class="file-name" id="fileName"></span>
+                    <span class="file-size" id="fileSize"></span>
+                </div>
+                <div class="file-actions">
+                    <button id="analyzeBtn" class="btn-success btn-glow">Analyze</button>
+                    <button id="clearBtn" class="btn-secondary btn-glow">Clear</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loading Section -->
+        <div class="loading-section glass-card" id="loadingSection" style="display:none;">
+            <div class="spinner"></div>
+            <p>Analyzing packets... Please wait</p>
+        </div>
+
+        <!-- Dashboard Section -->
+        <div id="dashboardSection" style="display:none;">
+            <!-- Stats Cards -->
+            <div class="stats-grid">
+                <div class="stat-card glass-card">
+                    <div class="stat-icon">📦</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="statTotalPackets">0</div>
+                        <div class="stat-label">Total Packets</div>
+                    </div>
+                </div>
+                <div class="stat-card glass-card">
+                    <div class="stat-icon">💾</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="statTotalBytes">0</div>
+                        <div class="stat-label">Total Bytes</div>
+                    </div>
+                </div>
+                <div class="stat-card glass-card">
+                    <div class="stat-icon">🌐</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="statUniqueIPs">0</div>
+                        <div class="stat-label">Unique IPs</div>
+                    </div>
+                </div>
+                <div class="stat-card glass-card">
+                    <div class="stat-icon">🔌</div>
+                    <div class="stat-content">
+                        <div class="stat-value" id="statProtocols">0</div>
+                        <div class="stat-label">Protocols</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Charts Section -->
+            <div class="charts-grid">
+                <div class="chart-card glass-card">
+                    <h3>Protocol Distribution</h3>
+                    <canvas id="protocolChart"></canvas>
+                </div>
+                <div class="chart-card glass-card">
+                    <h3>Application Protocols</h3>
+                    <canvas id="appProtocolChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Top IPs Section -->
+            <div class="top-ips-grid">
+                <div class="top-ips-card glass-card">
+                    <h3>🔝 Top Source IPs</h3>
+                    <div id="topSourcesList"></div>
+                </div>
+                <div class="top-ips-card glass-card">
+                    <h3>🎯 Top Destination IPs</h3>
+                    <div id="topDestsList"></div>
+                </div>
+            </div>
+
+            <!-- Packets Table Section -->
+            <div class="results-section glass-card">
+                <div class="results-header">
+                    <h2>📊 Packet Details</h2>
+                    <div class="action-buttons">
+                        <button id="exportBtn" class="btn-secondary btn-glow">Export CSV</button>
+                        <button id="exportJsonBtn" class="btn-secondary btn-glow">Export JSON</button>
+                    </div>
+                </div>
+
+                <div class="filters">
+                    <input type="text" id="searchFilter" placeholder="Search packets..." class="search-input">
+                    <select id="protocolFilter" class="filter-select">
+                        <option value="">All L4 Protocols</option>
+                    </select>
+                    <select id="appProtocolFilter" class="filter-select">
+                        <option value="">All App Protocols</option>
+                    </select>
+                </div>
+
+                <div class="table-container">
+                    <table id="packetsTable" class="packets-table">
+                        <thead>
+                            <tr>
+                                <th>No.</th>
+                                <th>Source</th>
+                                <th>Destination</th>
+                                <th>Protocol</th>
+                                <th>App Protocol</th>
+                                <th>Length</th>
+                                <th>Summary</th>
+                            </tr>
+                        </thead>
+                        <tbody id="packetsBody"></tbody>
+                    </table>
+                </div>
+
+                <div class="pagination">
+                    <button id="prevBtn" class="btn-secondary btn-glow">← Previous</button>
+                    <span id="pageInfo">Page 1 of 1</span>
+                    <button id="nextBtn" class="btn-secondary btn-glow">Next →</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Error Section -->
+        <div class="error-section glass-card" id="errorSection" style="display:none;">
+            <div class="error-message">
+                <h3>❌ Analysis Failed</h3>
+                <p id="errorText"></p>
+                <button id="retryBtn" class="btn-primary btn-glow">Try Again</button>
+            </div>
+        </div>
+
+        <!-- Session Modal -->
+        <div id="sessionModal" class="session-modal">
+            <div class="session-modal-content">
+                <div class="session-modal-header">
+                    <h2>📋 Previous Uploads</h2>
+                    <button class="close-modal" id="closeModal">&times;</button>
+                </div>
+                <div id="sessionsList" class="sessions-list">
+                    <!-- Sessions will be populated here by JavaScript -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        <p>NetScope Analyzer v2.0 | Professional PCAP Analysis Tool | Built with C++ & Crow Framework</p>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
